@@ -6,12 +6,10 @@ const morgan = require('morgan');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const pem = require('pem');
-const https = require('https');
 
 // ---------------- BASIC CONFIG ----------------
 const PORT = process.env.PORT || 4001;
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:9001';
+const BACKEND_URL = process.env.BACKEND_URL || 'https://app-dummy.onrender.com';
 const ML_SCORE_URL = process.env.ML_SCORE_URL || 'http://localhost:5000/score';
 const SIGNATURES_PATH = path.join(__dirname, 'signatures.json');
 const DB_DIR = path.join(__dirname, '..', 'db');
@@ -42,7 +40,7 @@ function loadSignaturesFromDisk() {
   }
 }
 
-function evaluateSignatures(ctx, req) {
+function evaluateSignatures(ctx) {
   const sigs = loadSignaturesFromDisk();
   let risk = 0.0;
   const reasons = [];
@@ -168,7 +166,7 @@ async function inspectAndForward(req, res) {
   const forwardPath = req.originalUrl.replace(/^\/fw/, '');
   const target = BACKEND_URL + forwardPath;
 
-  const sigDecision = evaluateSignatures(ctx, req);
+  const sigDecision = evaluateSignatures(ctx);
   const ml = await scoreWithML(ctx);
   const rbacAllowed = checkRBAC(ctx.role, forwardPath);
 
@@ -224,17 +222,13 @@ async function start() {
 
   createAdminEndpoints(app);
 
-  // ---------------- FIXED ROUTE ----------------
-  // Use a middleware that matches all paths starting with /fw
+  // All /fw requests go through firewall
   app.use('/fw', inspectAndForward);
 
-  pem.createCertificate({ days: 365, selfSigned: true }, (err, keys) => {
-    if (err) throw err;
-    const server = https.createServer({ key: keys.serviceKey, cert: keys.certificate }, app);
-    server.listen(PORT, () => {
-      console.log(`AI-NGFW Gateway running on https://localhost:${PORT}`);
-      console.log('Forwarding to backend:', BACKEND_URL);
-    });
+  // Plain HTTP server, listen on 0.0.0.0
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`AI-NGFW Gateway running on http://0.0.0.0:${PORT}`);
+    console.log('Forwarding to backend:', BACKEND_URL);
   });
 }
 
