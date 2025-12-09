@@ -165,7 +165,8 @@ async function inspectAndForward(req, res) {
     userId: req.headers['x-user-id'] || 'anonymous',
   };
 
-  const forwardPath = req.url.replace(/^\/fw/, '');
+  // Use the named param captured from route
+  const forwardPath = '/' + (req.params.fwPath || '');
   const target = BACKEND_URL + forwardPath;
 
   const sigDecision = evaluateSignatures(ctx, req);
@@ -224,8 +225,8 @@ async function start() {
 
   createAdminEndpoints(app);
 
-  // ✅ FIX: modern Express requires named param for wildcard
-  app.all('/fw/:path(*)', inspectAndForward);
+  // Corrected route with named wildcard
+  app.all('/fw/:fwPath(*)', inspectAndForward);
 
   pem.createCertificate({ days: 365, selfSigned: true }, (err, keys) => {
     if (err) throw err;
