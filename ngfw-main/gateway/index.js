@@ -15,8 +15,7 @@ const PORT = process.env.PORT || 4001;
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:9001';
 
 const ML_SCORE_URL = process.env.ML_SCORE_URL || 'http://localhost:5000/score';
-const ML_POLICY_URL =
-  process.env.ML_POLICY_URL || 'http://localhost:5000/policy/recommend';
+const ML_POLICY_URL = process.env.ML_POLICY_URL || 'http://localhost:5000/policy/recommend';
 
 const SIGNATURES_PATH = path.join(__dirname, 'signatures.json');
 const DB_DIR = path.join(__dirname, '..', 'db');
@@ -29,18 +28,9 @@ if (!fs.existsSync(DB_DIR)) {
 let auditLogs = [];
 const MAX_LOGS = 5000;
 
-// DDoS / rate limiting
-const RATE_WINDOW_MS = 5000;
-const RATE_LIMIT = 20;
-const rateTable = new Map();
-
 // ---------------- SIGNATURE ENGINE ----------------
 
-let signatureCache = {
-  loadedAt: null,
-  mtimeMs: 0,
-  signatures: [],
-};
+let signatureCache = { loadedAt: null, mtimeMs: 0, signatures: [] };
 
 function loadSignaturesFromDisk() {
   try {
@@ -51,11 +41,7 @@ function loadSignaturesFromDisk() {
     const raw = fs.readFileSync(SIGNATURES_PATH, 'utf8');
     const parsed = JSON.parse(raw);
     const sigs = Array.isArray(parsed.signatures) ? parsed.signatures : [];
-    signatureCache = {
-      loadedAt: new Date(),
-      mtimeMs: stat.mtimeMs,
-      signatures: sigs,
-    };
+    signatureCache = { loadedAt: new Date(), mtimeMs: stat.mtimeMs, signatures: sigs };
     console.log('[NGFW] Loaded', sigs.length, 'signatures from disk');
     return sigs;
   } catch (err) {
@@ -121,18 +107,9 @@ function appendToAuditChain(entry) {
 // ---------------- RBAC ----------------
 
 let RBAC = {
-  guest: {
-    allow: ['/info'],
-    deny: ['/admin', '/honeypot'],
-  },
-  user: {
-    allow: ['/info', '/profile'],
-    deny: ['/admin'],
-  },
-  admin: {
-    allow: ['*'],
-    deny: [],
-  },
+  guest: { allow: ['/info'], deny: ['/admin', '/honeypot'] },
+  user: { allow: ['/info', '/profile'], deny: ['/admin'] },
+  admin: { allow: ['*'], deny: [] },
 };
 
 function checkRBAC(role, path) {
@@ -148,12 +125,7 @@ async function scoreWithML(ctx) {
   try {
     const res = await axios.post(
       ML_SCORE_URL,
-      {
-        method: ctx.method,
-        path: ctx.path,
-        role: ctx.role,
-        userAgent: ctx.userAgent,
-      },
+      { method: ctx.method, path: ctx.path, role: ctx.role, userAgent: ctx.userAgent },
       { timeout: 1500 }
     );
     return {
@@ -173,105 +145,4 @@ function computePolicyDecision({ rbacAllowed, sigDecision, ml }) {
   if (combinedRisk > 1.0) combinedRisk = 1.0;
 
   let action = 'ALLOW';
-  if (!rbacAllowed) action = 'RBAC_BLOCK';
-  else if (sigDecision.hardBlock || combinedRisk >= 0.9) action = 'BLOCK';
-  else if (combinedRisk >= 0.6) action = 'FLAG';
-
-  const allow = action === 'ALLOW' || action === 'FLAG';
-  return { allow, action, risk: combinedRisk };
-}
-
-// ---------------- LOGGING ----------------
-
-function pushLog(entry) {
-  auditLogs.push(entry);
-  if (auditLogs.length > MAX_LOGS) auditLogs.shift();
-  appendToAuditChain(entry);
-}
-
-// ---------------- FIREWALL HANDLER ----------------
-
-async function inspectAndForward(req, res) {
-  const ctx = {
-    ip: req.ip,
-    method: req.method,
-    path: req.path,
-    rawPath: req.originalUrl,
-    userAgent: req.headers['user-agent'] || 'unknown',
-    role: req.headers['x-user-role'] || 'guest',
-  };
-
-  const forwardPath = req.url.replace(/^\/fw/, '');
-  const target = BACKEND_URL + forwardPath;
-
-  const sigDecision = evaluateSignatures(ctx, req);
-  const ml = await scoreWithML(ctx);
-  const rbacAllowed = checkRBAC(ctx.role, forwardPath);
-
-  const decision = computePolicyDecision({ rbacAllowed, sigDecision, ml });
-
-  const logEntry = {
-    time: new Date().toISOString(),
-    context: ctx,
-    decision,
-    statusCode: decision.allow ? 200 : 403,
-  };
-  pushLog(logEntry);
-
-  if (!decision.allow) {
-    return res.status(403).json({ error: 'Access denied', decision });
-  }
-
-  try {
-    const response = await axios({
-      method: req.method,
-      url: target,
-      data: req.body,
-      headers: req.headers,
-    });
-
-    res.status(response.status).send(response.data);
-  } catch (err) {
-    res.status(502).json({ error: 'BACKEND_ERROR', details: err.message });
-  }
-}
-
-// ---------------- ADMIN ENDPOINTS ----------------
-
-function createAdminEndpoints(app) {
-  app.get('/health', (req, res) =>
-    res.json({ status: 'ok', time: new Date().toISOString() })
-  );
-
-  app.get('/admin/logs', (req, res) => {
-    res.json({ logs: auditLogs.slice(-200).reverse() });
-  });
-
-  app.post('/admin/rbac', (req, res) => {
-    if (!req.body.rbac) return res.status(400).json({ error: 'rbac required' });
-    RBAC = req.body.rbac;
-    res.json({ ok: true, RBAC });
-  });
-}
-
-// ---------------- SERVER ----------------
-
-async function start() {
-  const app = express();
-  app.use(express.json());
-  app.use(cors());
-  app.use(morgan('dev'));
-
-  createAdminEndpoints(app);
-  app.all('/fw/*', inspectAndForward);
-
-  pem.createCertificate({ days: 365, selfSigned: true }, (err, keys) => {
-    const server = https.createServer({ key: keys.serviceKey, cert: keys.certificate }, app);
-    server.listen(PORT, () => {
-      console.log(`AI-NGFW Gateway running on https://localhost:${PORT}`);
-      console.log('Forwarding to backend:', BACKEND_URL);
-    });
-  });
-}
-
-start();
+  if (!rbacAllowed) action = 'RBAC
