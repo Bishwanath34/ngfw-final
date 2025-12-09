@@ -4,22 +4,36 @@ const cors = require('cors');
 const morgan = require('morgan');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const pem = require('pem');
 const https = require('https');
 
-const BACKEND_URL = process.env.BACKEND_URL || 'https://localhost:9443';
-const ML_SCORE_URL = process.env.ML_SCORE_URL || 'http://localhost:5000/score';
-const ML_POLICY_URL = process.env.ML_POLICY_URL || 'http://localhost:5000/policy/recommend';
+// ---------------- BASIC CONFIG ----------------
+
 const PORT = process.env.PORT || 4001;
+const BACKEND_URL = process.env.BACKEND_URL || 'https://localhost:9001';
+
+const ML_SCORE_URL = process.env.ML_SCORE_URL || 'http://localhost:5000/score';
+const ML_POLICY_URL =
+  process.env.ML_POLICY_URL || 'http://localhost:5000/policy/recommend';
 
 const SIGNATURES_PATH = path.join(__dirname, 'signatures.json');
+const DB_DIR = path.join(__dirname, '..', 'db');
+const CHAIN_FILE = path.join(DB_DIR, 'audit_chain.jsonl');
+
+if (!fs.existsSync(DB_DIR)) {
+  fs.mkdirSync(DB_DIR, { recursive: true });
+}
 
 let auditLogs = [];
 const MAX_LOGS = 5000;
 
-// ---------------------------------------------------------------------------
-// Signature engine (zero-delay updates)
-// ---------------------------------------------------------------------------
+// DDoS / rate limiting (very simple window per IP)
+const RATE_WINDOW_MS = 5000; // 5 second window
+const RATE_LIMIT = 20;       // >20 reqs per window => DDoS risk
+const rateTable = new Map(); // key: ip -> { windowStart, count }
+
+// ---------------- SIGNATURE ENGINE ----------------
 
 let signatureCache = {
   loadedAt: null,
@@ -45,7 +59,7 @@ function loadSignaturesFromDisk() {
     return sigs;
   } catch (err) {
     if (!signatureCache.signatures.length) {
-      console.log('[NGFW] Signature file not found or invalid, running with empty signature set:', err.message);
+      console.log('[NGFW] No signature file or invalid JSON; running with empty signatures:', err.message);
     }
     return signatureCache.signatures;
   }
@@ -66,7 +80,7 @@ function evaluateSignatures(ctx, req) {
 
     let matched = false;
 
-    if (!matched && sig.pathContains && ctx.path.includes(sig.pathContains)) {
+    if (sig.pathContains && ctx.path.includes(sig.pathContains)) {
       matched = true;
     }
 
@@ -74,8 +88,8 @@ function evaluateSignatures(ctx, req) {
       try {
         const re = new RegExp(sig.pathRegex, 'i');
         if (re.test(ctx.path)) matched = true;
-      } catch (e) {
-        // ignore invalid regex
+      } catch {
+        // ignore bad regex
       }
     }
 
@@ -87,7 +101,9 @@ function evaluateSignatures(ctx, req) {
     }
 
     if (!matched && sig.headerName && sig.headerContains) {
-      const headerVal = String(req.headers[String(sig.headerName).toLowerCase()] || '').toLowerCase();
+      const headerVal = String(
+        req.headers[String(sig.headerName).toLowerCase()] || ''
+      ).toLowerCase();
       if (headerVal.includes(String(sig.headerContains).toLowerCase())) {
         matched = true;
       }
@@ -109,9 +125,146 @@ function evaluateSignatures(ctx, req) {
   return { risk, reasons, hardBlock };
 }
 
-// ---------------------------------------------------------------------------
-// Context / RBAC / Rule risk
-// ---------------------------------------------------------------------------
+// ---------------- TAMPER-EVIDENT CHAIN ----------------
+
+let lastHash = null;
+let lastIndex = -1;
+
+function computeHash(block) {
+  const clone = { ...block };
+  delete clone.hash;
+  const payload = JSON.stringify(clone);
+  return crypto.createHash('sha256').update(payload).digest('hex');
+}
+
+function bootstrapChain() {
+  if (!fs.existsSync(CHAIN_FILE)) {
+    lastHash = null;
+    lastIndex = -1;
+    return;
+  }
+  try {
+    const content = fs.readFileSync(CHAIN_FILE, 'utf8').trim();
+    if (!content) {
+      lastHash = null;
+      lastIndex = -1;
+      return;
+    }
+    const lines = content.split('\n').filter(Boolean);
+    const lastBlock = JSON.parse(lines[lines.length - 1]);
+    lastHash = lastBlock.hash || null;
+    if (typeof lastBlock.index === 'number') {
+      lastIndex = lastBlock.index;
+    } else {
+      lastIndex = lines.length - 1;
+    }
+    console.log(
+      '[NGFW] Bootstrapped audit chain. Last index:',
+      lastIndex,
+      'Last hash:',
+      lastHash
+    );
+  } catch (err) {
+    console.error('[NGFW] Failed to bootstrap audit chain:', err.message);
+    lastHash = null;
+    lastIndex = -1;
+  }
+}
+
+function appendToAuditChain(entry) {
+  try {
+    const ctx = entry.context || {};
+    const dec = entry.decision || {};
+    const tls = entry.tls || {};
+
+    const block = {
+      index: lastIndex + 1,
+      timestamp: entry.time || new Date().toISOString(),
+      ctx: {
+        method: ctx.method,
+        path: ctx.path,
+        rawPath: ctx.rawPath,
+        ip: ctx.ip,
+        userId: ctx.userId,
+        role: ctx.role,
+        userAgent: ctx.userAgent,
+      },
+      tls: {
+        version: tls.version || null,
+        cipher: tls.cipher || null,
+        risk: tls.risk || null,
+      },
+      decision: {
+        allow: !!dec.allow,
+        action: dec.action,
+        risk: dec.risk,
+        label: dec.label,
+        policy_level: dec.policy_level,
+        rule_risk: entry.ruleRisk,
+        ml_risk: entry.mlRisk,
+        tls_risk: entry.tlsRisk,
+        sig_risk: entry.sigRisk,
+        ddos_risk: entry.ddosRisk,
+        reasons: dec.reasons || entry.reasons || [],
+      },
+      statusCode: entry.statusCode ?? null,
+      prevHash: lastHash,
+    };
+
+    block.hash = computeHash(block);
+    fs.appendFileSync(CHAIN_FILE, JSON.stringify(block) + '\n');
+    lastHash = block.hash;
+    lastIndex = block.index;
+  } catch (err) {
+    console.error('[NGFW] Failed to append to audit chain:', err.message);
+  }
+}
+
+function loadFullChain() {
+  if (!fs.existsSync(CHAIN_FILE)) return [];
+  const content = fs.readFileSync(CHAIN_FILE, 'utf8').trim();
+  if (!content) return [];
+  return content
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+function verifyChain() {
+  const chain = loadFullChain();
+  let prevHash = null;
+
+  for (let i = 0; i < chain.length; i++) {
+    const block = chain[i];
+    if (block.prevHash !== prevHash) {
+      return {
+        ok: false,
+        brokenAt: i,
+        reason: 'prevHash mismatch',
+        length: chain.length,
+      };
+    }
+    const recalculated = computeHash(block);
+    if (recalculated !== block.hash) {
+      return {
+        ok: false,
+        brokenAt: i,
+        reason: 'hash mismatch',
+        length: chain.length,
+      };
+    }
+    prevHash = block.hash;
+  }
+
+  return {
+    ok: true,
+    brokenAt: null,
+    reason: null,
+    length: chain.length,
+  };
+}
+
+// ---------------- CONTEXT / RBAC / RULE RISK ----------------
 
 function buildContext(req) {
   const socket = req.socket || req.connection;
@@ -141,6 +294,7 @@ function buildContext(req) {
     ip,
     method: req.method,
     path: req.path,
+    rawPath: req.originalUrl || req.url || req.path,
     userAgent: req.headers['user-agent'] || 'unknown',
     timestamp: new Date().toISOString(),
     userId: req.headers['x-user-id'] || 'anonymous',
@@ -154,11 +308,12 @@ function buildContext(req) {
   };
 }
 
-// simple RBAC table for demo
-const RBAC = {
+// RBAC table (mutable so /admin/rbac can update it)
+
+let RBAC = {
   guest: {
     allow: ['/info'],
-    deny: ['/admin', '/admin/secret', '/admin/', '/honeypot'],
+    deny: ['/admin', '/admin/secret', '/admin', '/honeypot'],
   },
   user: {
     allow: ['/info', '/profile'],
@@ -169,6 +324,17 @@ const RBAC = {
     deny: [],
   },
 };
+
+function normalizeRBAC(rbacInput) {
+  const out = {};
+  for (const [role, conf] of Object.entries(rbacInput || {})) {
+    out[role] = {
+      allow: Array.isArray(conf.allow) ? conf.allow : [],
+      deny: Array.isArray(conf.deny) ? conf.deny : [],
+    };
+  }
+  return out;
+}
 
 function checkRBAC(role, pathReq) {
   const rules = RBAC[role] || RBAC.guest;
@@ -216,6 +382,18 @@ async function checkRiskRule(ctx) {
     reasons.push('honeypot_path');
   }
 
+  // Simple SQLi pattern detection on the raw URL
+  const raw = (ctx.rawPath || '').toLowerCase();
+  if (
+    raw.includes(" or 1=1") ||
+    raw.includes("' or '1'='1") ||
+    raw.includes('union select') ||
+    raw.includes('sleep(')
+  ) {
+    risk += 0.6;
+    reasons.push('sqli_pattern');
+  }
+
   if (risk > 1.0) risk = 1.0;
   ctx.risk_rule = risk;
 
@@ -226,9 +404,32 @@ async function checkRiskRule(ctx) {
   return { risk, label, reasons };
 }
 
-// ---------------------------------------------------------------------------
-// ML scoring
-// ---------------------------------------------------------------------------
+// ---------------- DDoS / RATE-LIMIT RISK ----------------
+
+function updateRateTable(ctx) {
+  const key = ctx.ip || ctx.userId || 'unknown';
+  const now = Date.now();
+  let entry = rateTable.get(key);
+
+  if (!entry || now - entry.windowStart > RATE_WINDOW_MS) {
+    entry = { windowStart: now, count: 0 };
+  }
+  entry.count += 1;
+  rateTable.set(key, entry);
+
+  let risk = 0.0;
+  const reasons = [];
+
+  if (entry.count > RATE_LIMIT) {
+    const overflow = entry.count - RATE_LIMIT;
+    risk = Math.min(1.0, overflow / 20); // up to +1.0 if flood is heavy
+    reasons.push('ddos_rate_limit');
+  }
+
+  return { ddosRisk: risk, ddosReasons: reasons, count: entry.count };
+}
+
+// ---------------- ML SCORING ----------------
 
 async function scoreWithML(ctx) {
   try {
@@ -256,20 +457,26 @@ async function scoreWithML(ctx) {
       policy_level: res.data?.policy_level || null,
     };
   } catch (err) {
-    console.error('ML service error:', err.message);
+    console.error('[NGFW] ML service error:', err.message);
     return { ml_risk: 0.0, ml_label: 'ml_unavailable', policy_level: null };
   }
 }
 
-// ---------------------------------------------------------------------------
-// Policy decision (inline ML-powered prevention)
-// ---------------------------------------------------------------------------
+// ---------------- POLICY DECISION ----------------
 
-function computePolicyDecision({ rbacAllowed, ruleDecision, ml, tlsRisk, sigDecision }) {
+function computePolicyDecision({
+  rbacAllowed,
+  ruleDecision,
+  ml,
+  tlsRisk,
+  sigDecision,
+  ddosRisk,
+}) {
   const mlRisk = typeof ml.ml_risk === 'number' ? ml.ml_risk : 0.0;
   const sigRisk = sigDecision.risk || 0.0;
+  const ddos = ddosRisk || 0.0;
 
-  let combinedRisk = mlRisk + 0.5 * sigRisk + 0.3 * tlsRisk;
+  let combinedRisk = mlRisk + 0.5 * sigRisk + 0.3 * tlsRisk + 0.6 * ddos;
   if (combinedRisk > 1.0) combinedRisk = 1.0;
 
   let action = 'ALLOW';
@@ -311,15 +518,14 @@ function computePolicyDecision({ rbacAllowed, ruleDecision, ml, tlsRisk, sigDeci
   };
 }
 
-// ---------------------------------------------------------------------------
-// Log helpers
-// ---------------------------------------------------------------------------
+// ---------------- LOG HELPERS / SIEM EXPORT ----------------
 
 function pushLog(entry) {
   auditLogs.push(entry);
   if (auditLogs.length > MAX_LOGS) {
     auditLogs.shift();
   }
+  appendToAuditChain(entry);
 }
 
 function normalizeLogForSIEM(entry) {
@@ -331,7 +537,7 @@ function normalizeLogForSIEM(entry) {
   return {
     timestamp: entry.time,
     method: ctx.method,
-    path: ctx.path,
+    path: ctx.rawPath || ctx.path,
     ip: ctx.ip,
     userId: ctx.userId,
     role: ctx.role,
@@ -346,6 +552,7 @@ function normalizeLogForSIEM(entry) {
     ml_risk: entry.mlRisk,
     tls_risk: entry.tlsRisk,
     sig_risk: entry.sigRisk,
+    ddos_risk: entry.ddosRisk,
     tls_version: tls.version,
     tls_cipher: tls.cipher,
     sig_reasons: Array.isArray(sigs.reasons)
@@ -371,9 +578,7 @@ function logsToCSV(logs) {
   return lines.join('\n');
 }
 
-// ---------------------------------------------------------------------------
-// Admin endpoints
-// ---------------------------------------------------------------------------
+// ---------------- ADMIN ENDPOINTS ----------------
 
 function createAdminEndpoints(app) {
   app.get('/health', (req, res) => {
@@ -396,13 +601,28 @@ function createAdminEndpoints(app) {
   });
 
   app.get('/admin/logs/export', (req, res) => {
+    const format = String(req.query.format || 'csv').toLowerCase();
     try {
+      if (format === 'json') {
+        const normalized = auditLogs.map(normalizeLogForSIEM);
+        const body = JSON.stringify(normalized, null, 2);
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader(
+          'Content-Disposition',
+          'attachment; filename="ngfw_logs.json"'
+        );
+        return res.send(body);
+      }
+
       const csv = logsToCSV(auditLogs);
       res.setHeader('Content-Type', 'text/csv');
-      res.setHeader('Content-Disposition', 'attachment; filename="ngfw_logs.csv"');
+      res.setHeader(
+        'Content-Disposition',
+        'attachment; filename="ngfw_logs.csv"'
+      );
       res.send(csv);
     } catch (err) {
-      console.error('Failed to export logs:', err.message);
+      console.error('[NGFW] Failed to export logs:', err.message);
       res.status(500).json({ error: 'EXPORT_FAILED' });
     }
   });
@@ -412,7 +632,7 @@ function createAdminEndpoints(app) {
       const response = await axios.get(ML_POLICY_URL, { timeout: 5000 });
       res.json(response.data);
     } catch (err) {
-      console.error('Policy recommendation error:', err.message);
+      console.error('[NGFW] Policy recommendation error:', err.message);
       res.status(502).json({
         error: 'POLICY_RECOMMENDATION_FAILED',
         message: 'ML policy engine not reachable',
@@ -420,11 +640,50 @@ function createAdminEndpoints(app) {
       });
     }
   });
+
+  // RBAC admin API
+  app.get('/admin/rbac', (req, res) => {
+    res.json(RBAC);
+  });
+
+  app.post('/admin/rbac', (req, res) => {
+    try {
+      const body = req.body || {};
+      if (!body.rbac || typeof body.rbac !== 'object') {
+        return res.status(400).json({ error: 'rbac object is required' });
+      }
+      RBAC = normalizeRBAC(body.rbac);
+      res.json({ ok: true, rbac: RBAC });
+    } catch (err) {
+      console.error('[NGFW] Failed to update RBAC:', err.message);
+      res.status(500).json({ error: 'RBAC_UPDATE_FAILED' });
+    }
+  });
+
+  // Chain endpoints + public verify
+  app.get('/admin/chain', (req, res) => {
+    const chain = loadFullChain();
+    res.json({ length: chain.length, chain });
+  });
+
+  app.get('/admin/chain/status', (req, res) => {
+    const result = verifyChain();
+    res.json({
+      ok: result.ok,
+      length: result.length,
+      lastIndex,
+      lastHash,
+      reason: result.reason,
+    });
+  });
+
+  app.get('/verify-chain', (req, res) => {
+    const result = verifyChain();
+    res.json(result);
+  });
 }
 
-// ---------------------------------------------------------------------------
-// TLS inspection + forwarding
-// ---------------------------------------------------------------------------
+// ---------------- MAIN FIREWALL ROUTE ----------------
 
 async function inspectAndForward(req, res) {
   const ctx = buildContext(req);
@@ -434,6 +693,9 @@ async function inspectAndForward(req, res) {
   const sigDecision = evaluateSignatures(ctx, req);
   const sigRisk = sigDecision.risk;
   const sigReasons = sigDecision.reasons;
+
+  // DDoS / rate-limit risk
+  const { ddosRisk, ddosReasons } = updateRateTable(ctx);
 
   let tlsRisk = 0.0;
   const tlsReasons = [];
@@ -468,11 +730,16 @@ async function inspectAndForward(req, res) {
     tlsReasons.push('suspicious_ua');
   }
 
+  // Special header to simulate TLS bot / scanner attack from the dummy site
+  if (req.headers['x-ngfw-sim-tls-bot'] === '1') {
+    tlsRisk += 0.6;
+    tlsReasons.push('simulated_tls_bot');
+  }
+
   if (tlsRisk > 1.0) tlsRisk = 1.0;
 
   const ruleDecision = await checkRiskRule(ctx);
   const ml = await scoreWithML(ctx);
-
   const rbacAllowed = checkRBAC(ctx.role, forwardPath);
 
   const decision = computePolicyDecision({
@@ -481,6 +748,7 @@ async function inspectAndForward(req, res) {
     ml,
     tlsRisk,
     sigDecision,
+    ddosRisk,
   });
 
   const baseEntry = {
@@ -505,16 +773,24 @@ async function inspectAndForward(req, res) {
       risk: decision.risk,
       policy_level: decision.policy_level,
       rbac: rbacAllowed,
+      reasons: [
+        ...ruleDecision.reasons,
+        ...tlsReasons,
+        ...sigReasons,
+        ...ddosReasons,
+      ],
     },
     targetPath: forwardPath,
     ruleRisk: ruleDecision.risk,
     mlRisk: ml.ml_risk,
     tlsRisk,
     sigRisk,
+    ddosRisk,
     reasons: [
       ...ruleDecision.reasons,
       ...tlsReasons,
       ...sigReasons,
+      ...ddosReasons,
     ],
   };
 
@@ -528,10 +804,13 @@ async function inspectAndForward(req, res) {
         ? 'RBAC violation'
         : sigDecision.hardBlock
         ? 'Matched high-confidence signature'
+        : ddosRisk > 0
+        ? 'Rate limit / DDoS protection'
         : 'ML policy engine classified as high risk',
       risk: decision.risk,
       tlsRisk,
       sigRisk,
+      ddosRisk,
       policy_level: decision.policy_level,
       reasons: blockedEntry.reasons,
     });
@@ -558,25 +837,28 @@ async function inspectAndForward(req, res) {
     res.set('x-ngfw-ml-risk', String(ml.ml_risk));
     res.set('x-ngfw-tls-risk', String(tlsRisk));
     res.set('x-ngfw-sig-risk', String(sigRisk));
+    res.set('x-ngfw-ddos-risk', String(ddosRisk));
     res.set('x-ngfw-final-risk', String(decision.risk));
     res.set('x-ngfw-label', decision.label);
 
     return res.status(response.status).json(response.data);
   } catch (err) {
-    console.error('Backend error:', err.message);
+    console.error('[NGFW] Backend error:', err.message);
     const errorEntry = { ...baseEntry, statusCode: 500, error: err.message };
     pushLog(errorEntry);
     return res.status(500).json({ error: 'TLS Backend unavailable' });
   }
 }
 
-// ---------------------------------------------------------------------------
-// TLS certificate & server bootstrap
-// ---------------------------------------------------------------------------
+// ---------------- TLS CERTS & SERVER BOOTSTRAP ----------------
 
 function ensureCerts() {
   return new Promise((resolve, reject) => {
-    if (fs.existsSync(path.join(__dirname, 'key.pem')) && fs.existsSync(path.join(__dirname, 'cert.pem'))) {
+    const keyPath = path.join(__dirname, 'key.pem');
+    const certPath = path.join(__dirname, 'cert.pem');
+
+    if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+      console.log('[NGFW] Using existing gateway TLS certs.');
       return resolve();
     }
 
@@ -584,8 +866,8 @@ function ensureCerts() {
       { days: 365, selfSigned: true, keyBits: 2048 },
       (err, keys) => {
         if (err) return reject(err);
-        fs.writeFileSync(path.join(__dirname, 'key.pem'), keys.serviceKey);
-        fs.writeFileSync(path.join(__dirname, 'cert.pem'), keys.certificate);
+        fs.writeFileSync(keyPath, keys.serviceKey);
+        fs.writeFileSync(certPath, keys.certificate);
         console.log('[NGFW] Generated self-signed TLS certs (key.pem, cert.pem)');
         resolve();
       }
@@ -594,20 +876,16 @@ function ensureCerts() {
 }
 
 async function startServer() {
+  bootstrapChain();
   await ensureCerts();
 
   const app = express();
   app.use(express.json());
-  app.use(
-    cors({
-      origin: true,
-      credentials: false,
-    })
-  );
+  app.use(cors({ origin: true, credentials: false }));
   app.use(morgan('dev'));
   app.set('trust proxy', true);
 
-  // Attach TLS / JA3-lite fingerprint to each request
+  // Attach TLS / JA3-lite fingerprint
   app.use((req, res, next) => {
     try {
       const socket = req.socket || req.connection;
@@ -681,13 +959,12 @@ async function startServer() {
 
       req.tlsFingerprint = fp;
     } catch (err) {
-      console.log('TLS fingerprint error:', err.message);
+      console.log('[NGFW] TLS fingerprint error:', err.message);
     }
     next();
   });
 
   createAdminEndpoints(app);
-
   app.use('/fw', inspectAndForward);
 
   const key = fs.readFileSync(path.join(__dirname, 'key.pem'));
@@ -696,11 +973,12 @@ async function startServer() {
   https.createServer({ key, cert }, app).listen(PORT, () => {
     console.log(`AI-NGFW Gateway running at https://localhost:${PORT}`);
     console.log(`Admin logs: https://localhost:${PORT}/admin/logs`);
+    console.log(`Verify chain: https://localhost:${PORT}/verify-chain`);
     console.log(`Traffic proxy: https://localhost:${PORT}/fw/*`);
   });
 }
 
 startServer().catch((err) => {
-  console.error('Fatal error starting AI-NGFW gateway:', err);
+  console.error('[NGFW] Fatal error starting gateway:', err);
   process.exit(1);
 });

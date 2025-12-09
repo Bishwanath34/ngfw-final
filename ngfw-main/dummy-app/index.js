@@ -92,7 +92,7 @@ async function startServer() {
     rejectUnauthorized: false,
   };
 
-  // IMPORTANT: use 9001 so ML server can stay on 5000
+  // IMPORTANT: use 9443 so ML server can stay on 5000
   const PORT = 9443;
 
   https.createServer(tlsOptions, app).listen(PORT, () => {

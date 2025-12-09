@@ -14,8 +14,7 @@ __pycache__/
 db/
 *.log
 
-# Secure
-*.pem
+
 
 # OS junk
 .DS_Store

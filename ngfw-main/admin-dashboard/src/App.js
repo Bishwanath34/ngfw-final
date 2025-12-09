@@ -36,26 +36,50 @@ const GATEWAY_URL = 'https://localhost:4001';
 function App() {
   const [logs, setLogs] = useState([]);
   const [filter, setFilter] = useState('all');
+  const [chainOK, setChainOK] = useState(true);
   const [policyRecs, setPolicyRecs] = useState(null);
 
-  // --------------------- Data loading ---------------------
+  // ---------- LOAD LOGS FROM GATEWAY ----------
 
   const loadLogs = async () => {
     try {
       const res = await axios.get(`${GATEWAY_URL}/admin/logs?limit=200`, {
         headers: { Accept: 'application/json' },
       });
-
       const list = res.data?.logs || res.data || [];
-      if (Array.isArray(list)) {
-        setLogs(list);
-      } else {
-        setLogs([]);
-      }
+      setLogs(Array.isArray(list) ? list : []);
     } catch (err) {
       console.error('Error fetching logs', err);
     }
   };
+
+  useEffect(() => {
+    loadLogs();
+    const id = setInterval(loadLogs, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // ---------- CHAIN INTEGRITY STATUS ----------
+
+  const checkChainStatus = async () => {
+    try {
+      const res = await axios.get(`${GATEWAY_URL}/verify-chain`, {
+        headers: { Accept: 'application/json' },
+      });
+      setChainOK(res.data?.ok === true);
+    } catch (err) {
+      console.error('Error checking chain status', err);
+      setChainOK(false);
+    }
+  };
+
+  useEffect(() => {
+    checkChainStatus();
+    const id = setInterval(checkChainStatus, 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  // ---------- POLICY RECOMMENDATIONS ----------
 
   const loadPolicyRecs = async () => {
     try {
@@ -69,18 +93,12 @@ function App() {
   };
 
   useEffect(() => {
-    loadLogs();
-    const id = setInterval(loadLogs, 1000);
-    return () => clearInterval(id);
-  }, []);
-
-  useEffect(() => {
     loadPolicyRecs();
     const id = setInterval(loadPolicyRecs, 15000);
     return () => clearInterval(id);
   }, []);
 
-  // --------------------- Traffic simulator ---------------------
+  // ---------- TRAFFIC SIMULATOR HELPERS ----------
 
   const simulateRequest = async (path, userId, role) => {
     try {
@@ -93,8 +111,8 @@ function App() {
       });
       await loadLogs();
     } catch (err) {
-      console.error('Simulation error', err);
-      alert('Simulation request failed. Check that gateway + backend + ML are running.');
+      console.error('Simulation error:', err);
+      alert('Simulation failed. Check that gateway, backend and ML are running.');
     }
   };
 
@@ -107,11 +125,38 @@ function App() {
   const simulateGuestAdminRBAC = () =>
     simulateRequest('/admin/secret', 'guest123', 'guest');
 
-  // --------------------- Derived stats ---------------------
+  // ---------- EXPORT LOGS (JSON / CSV) ----------
+
+  const handleExport = async (format) => {
+    try {
+      const res = await axios.get(
+        `${GATEWAY_URL}/admin/logs/export?format=${format}`,
+        { responseType: 'blob' }
+      );
+
+      const blob = res.data;
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+
+      link.href = url;
+      link.download = format === 'csv' ? 'ngfw_logs.csv' : 'ngfw_logs.json';
+
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Error exporting logs', err);
+      alert('Failed to export logs. Check gateway console for details.');
+    }
+  };
+
+  // ---------- FILTERED LOGS + STATS ----------
 
   const filteredLogs = logs.filter((entry) => {
     if (filter === 'all') return true;
-    const allowed = entry.decision?.allow !== false && entry.statusCode < 400;
+    const allowed =
+      entry.statusCode < 400 && entry.decision?.allow !== false;
     if (filter === 'allowed') return allowed;
     if (filter === 'blocked') return !allowed;
     return true;
@@ -125,12 +170,13 @@ function App() {
   const blockedCount = logs.filter(
     (e) => e.statusCode >= 400 || e.decision?.allow === false
   ).length;
-
   const highRiskCount = logs.filter(
     (e) =>
       e.decision?.label === 'high_risk' ||
       e.decision?.label === 'rbac_block'
   ).length;
+
+  // ---------- PER-USER SUMMARY ----------
 
   const perUser = {};
   for (const e of logs) {
@@ -154,6 +200,8 @@ function App() {
     ...stats,
   }));
 
+  // ---------- ANALYTICS DATA (for charts) ----------
+
   const logsByTime = [...logs].sort(
     (a, b) => new Date(a.time) - new Date(b.time)
   );
@@ -171,7 +219,8 @@ function App() {
       pathMap[p] = { path: p, total: 0, allowed: 0, blocked: 0 };
     }
     pathMap[p].total += 1;
-    const allowed = e.statusCode < 400 && e.decision?.allow !== false;
+    const allowed =
+      e.statusCode < 400 && e.decision?.allow !== false;
     if (allowed) pathMap[p].allowed += 1;
     else pathMap[p].blocked += 1;
   }
@@ -186,14 +235,14 @@ function App() {
     }
   };
 
-  // --------------------- UI ---------------------
+  // ---------- UI ----------
 
   return (
     <>
       <AppBar position="static" color="primary">
         <Toolbar>
           <Typography variant="h6" sx={{ flexGrow: 1 }}>
-            AI‑NGFW Dashboard
+            AI–NGFW Dashboard
           </Typography>
           <Button color="inherit" onClick={loadLogs}>
             Refresh
@@ -214,16 +263,21 @@ function App() {
           </Paper>
           <Paper sx={{ flex: 1, p: 2, bgcolor: '#7f1d1d', color: 'white' }}>
             <Typography variant="subtitle2">
-              High‑Risk / RBAC Blocks
+              High-Risk / RBAC Blocks
             </Typography>
             <Typography variant="h4">{highRiskCount}</Typography>
           </Paper>
-          <Paper sx={{ flex: 1, p: 2, bgcolor: '#1f2937', color: 'white' }}>
-            <Typography variant="subtitle2">ML Policy Engine</Typography>
-            <Typography variant="body2">
-              {policyRecs
-                ? 'Recommendations available'
-                : 'Waiting for ML server...'}
+          <Paper
+            sx={{
+              flex: 1,
+              p: 2,
+              bgcolor: chainOK ? '#064e3b' : '#b91c1c',
+              color: 'white',
+            }}
+          >
+            <Typography variant="subtitle2">Log Integrity</Typography>
+            <Typography variant="h5">
+              {chainOK ? 'Verified' : 'TAMPERED!'}
             </Typography>
           </Paper>
         </Box>
@@ -244,14 +298,14 @@ function App() {
             </Typography>
             {timeSeriesData.length === 0 ? (
               <Typography variant="body2" sx={{ color: '#9ca3af' }}>
-                No data yet. Use the simulator on the right or the dummy site
-                to generate live traffic.
+                No data yet. Use the simulator or dummy site to generate
+                traffic.
               </Typography>
             ) : (
               <Box sx={{ width: '100%', height: 260 }}>
                 <ResponsiveContainer>
                   <LineChart data={timeSeriesData}>
-                    <CartesianGrid strokeDasharray="3 3" />
+                    <CartesianGrid strokeDasharray="3 3' " />
                     <XAxis dataKey="timeLabel" />
                     <YAxis />
                     <Tooltip />
@@ -329,7 +383,8 @@ function App() {
             >
               {displayLogs.slice(0, 20).map((entry, idx) => {
                 const allowed =
-                  entry.statusCode < 400 && entry.decision?.allow !== false;
+                  entry.statusCode < 400 &&
+                  entry.decision?.allow !== false;
                 return (
                   <Box
                     key={idx}
@@ -372,8 +427,7 @@ function App() {
                   variant="body2"
                   sx={{ color: '#6b7280' }}
                 >
-                  No traffic yet. Use the simulator or dummy site to
-                  generate events.
+                  No traffic yet.
                 </Typography>
               )}
             </Box>
@@ -395,8 +449,8 @@ function App() {
               variant="body2"
               sx={{ mb: 2, color: '#9ca3af' }}
             >
-              Use these buttons during the demo to generate live
-              events and show ML‑driven prevention.
+              Use these buttons during the demo to generate live events
+              and show ML + RBAC + signature-based decisions.
             </Typography>
 
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
@@ -443,6 +497,33 @@ function App() {
             </Typography>
 
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+              {/* Export buttons */}
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => handleExport('json')}
+                sx={{
+                  borderColor: '#4b5563',
+                  color: 'white',
+                  '&:hover': { borderColor: '#9ca3af' },
+                }}
+              >
+                Export JSON
+              </Button>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => handleExport('csv')}
+                sx={{
+                  borderColor: '#4b5563',
+                  color: 'white',
+                  '&:hover': { borderColor: '#9ca3af' },
+                }}
+              >
+                Export CSV
+              </Button>
+
+              {/* Filter buttons */}
               <ToggleButtonGroup
                 value={filter}
                 exclusive
@@ -450,37 +531,46 @@ function App() {
                 size="small"
                 color="primary"
               >
-                <ToggleButton value="all">All</ToggleButton>
-                <ToggleButton value="allowed">Allowed</ToggleButton>
-                <ToggleButton value="blocked">Blocked</ToggleButton>
+                <ToggleButton
+                  value="all"
+                  sx={{
+                    color: 'white',
+                    borderColor: '#4b5563',
+                    '&.Mui-selected': {
+                      backgroundColor: '#2563eb',
+                      color: '#fff',
+                    },
+                  }}
+                >
+                  ALL
+                </ToggleButton>
+                <ToggleButton
+                  value="allowed"
+                  sx={{
+                    color: 'white',
+                    borderColor: '#4b5563',
+                    '&.Mui-selected': {
+                      backgroundColor: '#16a34a',
+                      color: '#fff',
+                    },
+                  }}
+                >
+                  ALLOWED
+                </ToggleButton>
+                <ToggleButton
+                  value="blocked"
+                  sx={{
+                    color: 'white',
+                    borderColor: '#4b5563',
+                    '&.Mui-selected': {
+                      backgroundColor: '#b91c1c',
+                      color: '#fff',
+                    },
+                  }}
+                >
+                  BLOCKED
+                </ToggleButton>
               </ToggleButtonGroup>
-
-              <Button
-                variant="outlined"
-                size="small"
-                onClick={async () => {
-                  try {
-                    const res = await axios.get(
-                      `${GATEWAY_URL}/admin/logs/export`,
-                      { responseType: 'blob' }
-                    );
-                    const blob = res.data;
-                    const url = window.URL.createObjectURL(blob);
-                    const link = document.createElement('a');
-                    link.href = url;
-                    link.download = 'ngfw_logs.csv';
-                    document.body.appendChild(link);
-                    link.click();
-                    link.remove();
-                    window.URL.revokeObjectURL(url);
-                  } catch (err) {
-                    console.error('Export error', err);
-                    alert('Failed to export logs. Check gateway console.');
-                  }
-                }}
-              >
-                Export CSV
-              </Button>
             </Box>
           </Box>
 
@@ -572,10 +662,10 @@ function App() {
           </TableContainer>
         </Paper>
 
-        {/* Per-user summary */}
+        {/* PER-USER RISK SUMMARY */}
         <Paper sx={{ p: 2, bgcolor: '#020617', mt: 3 }}>
           <Typography variant="h6" color="white" sx={{ mb: 2 }}>
-            Per‑user risk summary
+            Per-user risk summary
           </Typography>
           <TableContainer sx={{ maxHeight: 260 }}>
             <Table stickyHeader size="small">
@@ -585,13 +675,13 @@ function App() {
                     User
                   </TableCell>
                   <TableCell sx={{ color: 'white', bgcolor: '#020617' }}>
-                    Total
+                    Total Requests
                   </TableCell>
                   <TableCell sx={{ color: 'white', bgcolor: '#020617' }}>
                     Blocked
                   </TableCell>
                   <TableCell sx={{ color: 'white', bgcolor: '#020617' }}>
-                    High‑risk / RBAC
+                    High-Risk / RBAC Blocks
                   </TableCell>
                 </TableRow>
               </TableHead>
