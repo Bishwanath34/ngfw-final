@@ -305,7 +305,7 @@ function App() {
               <Box sx={{ width: '100%', height: 260 }}>
                 <ResponsiveContainer>
                   <LineChart data={timeSeriesData}>
-                    <CartesianGrid strokeDasharray="3 3' " />
+                    <CartesianGrid strokeDasharray="3 3" />
                     <XAxis dataKey="timeLabel" />
                     <YAxis />
                     <Tooltip />
@@ -347,8 +347,17 @@ function App() {
                     <YAxis />
                     <Tooltip />
                     <Legend />
-                    <Bar dataKey="allowed" name="Allowed" />
-                    <Bar dataKey="blocked" name="Blocked" />
+                    {/* Brighter colors so bars are visible on dark theme */}
+                    <Bar
+                      dataKey="allowed"
+                      name="Allowed"
+                      fill="#22c55e"   // bright green
+                    />
+                    <Bar
+                      dataKey="blocked"
+                      name="Blocked"
+                      fill="#ef4444"   // bright red
+                    />
                   </BarChart>
                 </ResponsiveContainer>
               </Box>
