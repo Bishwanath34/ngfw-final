@@ -223,7 +223,9 @@ async function start() {
   app.use(morgan('dev'));
 
   createAdminEndpoints(app);
-  app.all('/fw/*', inspectAndForward);
+
+  // ✅ FIX: modern Express requires named param for wildcard
+  app.all('/fw/:path(*)', inspectAndForward);
 
   pem.createCertificate({ days: 365, selfSigned: true }, (err, keys) => {
     if (err) throw err;
