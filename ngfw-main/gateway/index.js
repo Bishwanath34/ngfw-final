@@ -6,6 +6,7 @@ const morgan = require('morgan');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const https = require('https');
 
 // ---------------- BASIC CONFIG ----------------
 const PORT = process.env.PORT || 4001;
@@ -35,7 +36,8 @@ function loadSignaturesFromDisk() {
     signatureCache = { loadedAt: new Date(), mtimeMs: stat.mtimeMs, signatures: sigs };
     console.log('[NGFW] Loaded', sigs.length, 'signatures from disk');
     return sigs;
-  } catch {
+  } catch (err) {
+    console.warn('[NGFW] Could not load signatures:', err.message);
     return signatureCache.signatures;
   }
 }
@@ -121,7 +123,8 @@ async function scoreWithML(ctx) {
       ml_label: res.data?.ml_label ?? 'normal',
       policy_level: res.data?.policy_level ?? null,
     };
-  } catch {
+  } catch (err) {
+    console.warn('[NGFW] ML scoring failed:', err.message);
     return { ml_risk: 0.0, ml_label: 'ml_error', policy_level: null };
   }
 }
@@ -132,13 +135,9 @@ function computePolicyDecision({ rbacAllowed, sigDecision, ml }) {
   if (combinedRisk > 1.0) combinedRisk = 1.0;
 
   let action = 'ALLOW';
-  if (!rbacAllowed) {
-    action = 'RBAC_BLOCK';
-  } else if (sigDecision.hardBlock || combinedRisk >= 0.9) {
-    action = 'BLOCK';
-  } else if (combinedRisk >= 0.6) {
-    action = 'FLAG';
-  }
+  if (!rbacAllowed) action = 'RBAC_BLOCK';
+  else if (sigDecision.hardBlock || combinedRisk >= 0.9) action = 'BLOCK';
+  else if (combinedRisk >= 0.6) action = 'FLAG';
 
   const allow = action === 'ALLOW' || action === 'FLAG';
   return { allow, action, risk: combinedRisk };
@@ -169,7 +168,6 @@ async function inspectAndForward(req, res) {
   const sigDecision = evaluateSignatures(ctx);
   const ml = await scoreWithML(ctx);
   const rbacAllowed = checkRBAC(ctx.role, forwardPath);
-
   const decision = computePolicyDecision({ rbacAllowed, sigDecision, ml });
 
   const logEntry = {
@@ -185,15 +183,19 @@ async function inspectAndForward(req, res) {
   }
 
   try {
+    console.log('[NGFW] Forwarding request to:', target);
     const response = await axios({
       method: req.method,
       url: target,
       data: req.body,
-      headers: req.headers,
+      headers: { ...req.headers, host: undefined }, // avoid host conflicts
+      timeout: 20000, // 20s timeout
+      httpsAgent: new https.Agent({ rejectUnauthorized: false }), // for self-signed certs
       validateStatus: () => true,
     });
     res.status(response.status).send(response.data);
   } catch (err) {
+    console.error('[NGFW] Backend forward error:', err.message);
     res.status(502).json({ error: 'BACKEND_ERROR', details: err.message });
   }
 }
@@ -221,11 +223,8 @@ async function start() {
   app.use(morgan('dev'));
 
   createAdminEndpoints(app);
-
-  // All /fw requests go through firewall
   app.use('/fw', inspectAndForward);
 
-  // Plain HTTP server, listen on 0.0.0.0
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`AI-NGFW Gateway running on http://0.0.0.0:${PORT}`);
     console.log('Forwarding to backend:', BACKEND_URL);
