@@ -165,8 +165,8 @@ async function inspectAndForward(req, res) {
     userId: req.headers['x-user-id'] || 'anonymous',
   };
 
-  // Use the named param captured from route
-  const forwardPath = '/' + (req.params.fwPath || '');
+  // Remove the /fw prefix from the original URL
+  const forwardPath = req.originalUrl.replace(/^\/fw/, '');
   const target = BACKEND_URL + forwardPath;
 
   const sigDecision = evaluateSignatures(ctx, req);
@@ -225,8 +225,8 @@ async function start() {
 
   createAdminEndpoints(app);
 
-  // Corrected route with named wildcard
-  app.all('/fw/:fwPath(*)', inspectAndForward);
+  // <-- FIXED ROUTE HERE -->
+  app.all('/fw/*', inspectAndForward);
 
   pem.createCertificate({ days: 365, selfSigned: true }, (err, keys) => {
     if (err) throw err;
