@@ -1,41 +1,16 @@
-const https = require('https');
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const pem = require('pem');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 app.use(express.raw({ type: '*/*' })); // Accept all content types
 
-// Generate self-signed cert for backend (one-time)
-async function ensureCerts() {
-  return new Promise((resolve, reject) => {
-    if (fs.existsSync('backend-cert.pem') && fs.existsSync('backend-key.pem')) {
-      resolve();
-      return;
-    }
-
-    pem.createCertificate(
-      { days: 365, selfSigned: true, keyBits: 2048 },
-      (err, keys) => {
-        if (err) return reject(err);
-        fs.writeFileSync('backend-key.pem', keys.serviceKey);
-        fs.writeFileSync('backend-cert.pem', keys.certificate);
-        console.log('[BACKEND] Generated self-signed TLS certs (backend-key.pem, backend-cert.pem)');
-        resolve();
-      }
-    );
-  });
-}
-
 // Basic demo endpoints
 app.get('/info', (req, res) => {
   res.json({
-    service: 'Dummy HTTPS Backend',
-    description:
-      'This is the protected service behind the AI‑NGFW gateway.',
+    service: 'Dummy Backend',
+    description: 'This is the protected service behind the AI‑NGFW gateway.',
     docs: ['/info', '/profile', '/admin/secret', '/honeypot/db-export'],
     time: new Date().toISOString(),
   });
@@ -82,24 +57,10 @@ app.get('/honeypot/db-export', (req, res) => {
   });
 });
 
-async function startServer() {
-  await ensureCerts();
+// Use environment variable PORT or default to 9443
+const PORT = process.env.PORT || 9443;
 
-  const tlsOptions = {
-    key: fs.readFileSync('backend-key.pem'),
-    cert: fs.readFileSync('backend-cert.pem'),
-    requestCert: false,
-    rejectUnauthorized: false,
-  };
-
-  // IMPORTANT: use 9443 so ML server can stay on 5000
-  const PORT = 9443;
-
-  https.createServer(tlsOptions, app).listen(PORT, () => {
-    console.log(`Dummy Backend running at https://localhost:${PORT}`);
-    console.log('Available endpoints: /info, /profile, /admin/secret, /honeypot/db-export');
-    console.log('Remember to trust backend cert in browser/OS');
-  });
-}
-
-startServer().catch(console.error);
+app.listen(PORT, () => {
+  console.log(`Dummy Backend running at http://localhost:${PORT}`);
+  console.log('Available endpoints: /info, /profile, /admin/secret, /honeypot/db-export');
+});
