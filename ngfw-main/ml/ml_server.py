@@ -6,6 +6,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from datetime import datetime
+import uvicorn
 
 # -------- Load trained ML bundle --------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,7 +31,22 @@ feature_cols = bundle.get("feature_cols") or [
 
 recent_scores = deque(maxlen=10000)
 
-app = FastAPI(title="AI-NGFW ML Scoring & Policy Engine")
+app = FastAPI(
+    title="AI-NGFW ML Scoring & Policy Engine",
+    description="Machine learning inline risk scoring and policy automation engine",
+    version="1.0.0"
+)
+
+# -------- Health root endpoint --------
+@app.get("/")
+def home():
+    return {
+        "service": "AI-NGFW ML Scoring & Policy Engine",
+        "status": "running",
+        "docs": "/docs",
+        "score_endpoint": "/score",
+        "policy_recommend": "/policy/recommend"
+    }
 
 
 # -------- Request schema --------
@@ -49,7 +65,6 @@ class RequestContext(BaseModel):
 
 # -------- Internal helpers --------
 def _row_from_context(ctx: RequestContext) -> dict:
-    """Build a single-row feature dict from the gateway context."""
     return {
         "method": ctx.method,
         "path": ctx.path,
@@ -65,60 +80,41 @@ def _row_from_context(ctx: RequestContext) -> dict:
 
 
 def _dynamic_thresholds() -> tuple[float, float]:
-    """Adaptive thresholds based on the recent score distribution.
-
-    Returns (medium_threshold, high_threshold).
-    """
     if len(recent_scores) < 200:
         return 0.30, 0.60
 
     arr = np.asarray(recent_scores, dtype=float)
-    # Use median for "medium" and 85th percentile for "high"
     medium = float(np.quantile(arr, 0.50))
     high = float(np.quantile(arr, 0.85))
 
-    # Clamp to reasonable ranges
     medium = max(0.15, min(medium, 0.50))
     high = max(0.60, min(high, 0.95))
     return medium, high
 
 
 def _anomaly_risk(df: pd.DataFrame) -> float:
-    """Return an anomaly-based risk score in [0, 1] using IsolationForest."""
     if anomaly_model is None or pipeline is None:
         return 0.0
-
     try:
         pre = pipeline.named_steps.get("preprocess")
         if pre is None:
             return 0.0
         X = pre.transform(df[feature_cols])
-        # decision_function: positive → inlier, negative → outlier
         raw = float(anomaly_model.decision_function(X)[0])
-        # Map [-1, +1] → [1, 0] so more negative is more risky
-        risk = max(0.0, min(1.0, -raw))
-        return risk
+        return max(0.0, min(1.0, -raw))
     except Exception:
         return 0.0
 
 
-def _combine_risks(
-    supervised: float,
-    rule_risk: float,
-    anomaly_risk: float,
-    ja3_bot_score: float,
-    tls_signals_count: int,
-) -> float:
-    """Weighted combination of different risk sources into a single [0, 1] score."""
-
+def _combine_risks(supervised, rule_risk, anomaly_risk, ja3_bot_score, tls_signals_count) -> float:
     def clamp01(x: float) -> float:
         return float(max(0.0, min(1.0, x)))
 
     supervised = clamp01(supervised)
     rule_risk = clamp01(rule_risk)
     anomaly_risk = clamp01(anomaly_risk)
-    ja3_component = clamp01(ja3_bot_score)  # already ~0..1
-    tls_component = clamp01(tls_signals_count / 5.0)  # 0..1 if <=5 signals
+    ja3_component = clamp01(ja3_bot_score)
+    tls_component = clamp01(tls_signals_count / 5.0)
 
     combined = (
         0.45 * supervised +
@@ -127,11 +123,11 @@ def _combine_risks(
         0.07 * ja3_component +
         0.03 * tls_component
     )
+
     return clamp01(combined)
 
 
 def _map_policy_level(risk: float, medium_thr: float, high_thr: float) -> str:
-    """Map a risk score into a policy level string."""
     if risk < medium_thr:
         return "level_0_trusted"
     if risk < high_thr:
@@ -141,28 +137,22 @@ def _map_policy_level(risk: float, medium_thr: float, high_thr: float) -> str:
     return "level_3_block"
 
 
-# -------- Scoring endpoint (inline prevention brain) --------
+# -------- Inline scoring brain --------
 @app.post("/score")
 def score(context: RequestContext):
-    # 1) Build feature row and dataframe
     row = _row_from_context(context)
     df = pd.DataFrame([row])
 
-    # 2) Supervised probability (RandomForest)
     if pipeline is None:
         supervised_proba = 0.0
     else:
-        proba = pipeline.predict_proba(df[feature_cols])[0][1]
-        supervised_proba = float(proba)
+        supervised_proba = float(pipeline.predict_proba(df[feature_cols])[0][1])
 
-    # 3) Adaptive thresholds
     recent_scores.append(supervised_proba)
     medium_thr, high_thr = _dynamic_thresholds()
 
-    # 4) Unsupervised anomaly score
     anomaly_r = _anomaly_risk(df)
 
-    # 5) Combine with rule risk + TLS signals
     combined_risk = _combine_risks(
         supervised=supervised_proba,
         rule_risk=context.risk_rule,
@@ -171,17 +161,13 @@ def score(context: RequestContext):
         tls_signals_count=context.tls_signals_count,
     )
 
-    # 6) Map to policy level & label
     level = _map_policy_level(combined_risk, medium_thr, high_thr)
 
-    if level == "level_0_trusted":
-        label = "ml_trusted"
-    elif level == "level_1_observe":
-        label = "ml_observe"
-    elif level == "level_2_restrict":
-        label = "ml_high_risk"
-    else:
-        label = "ml_critical"
+    label = {
+        "level_0_trusted": "ml_trusted",
+        "level_1_observe": "ml_observe",
+        "level_2_restrict": "ml_high_risk",
+    }.get(level, "ml_critical")
 
     return {
         "ml_risk": float(combined_risk),
@@ -189,17 +175,13 @@ def score(context: RequestContext):
         "policy_level": level,
         "supervised_risk": float(supervised_proba),
         "anomaly_risk": float(anomaly_r),
-        "thresholds": {
-            "medium": float(medium_thr),
-            "high": float(high_thr),
-        },
+        "thresholds": {"medium": float(medium_thr), "high": float(high_thr)},
     }
 
 
-# -------- Automated policy recommendation --------
+# -------- Automated policy recommendations --------
 @app.get("/policy/recommend")
 def policy_recommend():
-    """Analyze historical dataset.csv and recommend RBAC and threshold policies."""
     if not os.path.exists(CSV_PATH):
         return {
             "generatedAt": datetime.utcnow().isoformat() + "Z",
@@ -217,13 +199,12 @@ def policy_recommend():
         ).astype(int)
 
     recs = []
-
-    # Group by (role, path) to see which combinations are mostly malicious / benign
     grouped = df.groupby(["role", "path"], dropna=False)
+
     for (role, path), g in grouped:
         total = len(g)
         if total < 10:
-            continue  # not enough evidence
+            continue
 
         attacks = int(g["is_attack"].sum())
         benign = total - attacks
@@ -236,7 +217,7 @@ def policy_recommend():
                 "pathPrefix": path,
                 "suggestedAction": "deny",
                 "confidence": round(attack_rate, 3),
-                "reason": f"{attacks}/{total} (~{attack_rate:.0%}) of requests for this role/path looked malicious",
+                "reason": f"{attacks}/{total} (~{attack_rate:.0%}) were malicious",
             })
         elif attack_rate <= 0.05 and (g["statusCode"] >= 400).mean() > 0.5:
             recs.append({
@@ -245,23 +226,22 @@ def policy_recommend():
                 "pathPrefix": path,
                 "suggestedAction": "relax",
                 "confidence": round(1.0 - attack_rate, 3),
-                "reason": f"Almost all ({benign}/{total}) requests looked benign but many were blocked; candidate to relax.",
+                "reason": f"Mostly benign ({benign}/{total}) but heavily blocked",
             })
 
-    # Threshold recommendations based on global risk distribution
     global_medium, global_high = _dynamic_thresholds()
     thr_recs = [
         {
             "type": "threshold",
             "parameter": "medium_risk_threshold",
             "suggestedValue": round(global_medium, 3),
-            "reason": "Approximate median of recent supervised risk scores.",
+            "reason": "Approx median of recent risk scores",
         },
         {
             "type": "threshold",
             "parameter": "high_risk_threshold",
             "suggestedValue": round(global_high, 3),
-            "reason": "Approximate 85th percentile of recent supervised risk scores.",
+            "reason": "Approx 85th percentile of risk scores",
         },
     ]
 
@@ -272,11 +252,7 @@ def policy_recommend():
     }
 
 
-# -------- Run server --------
+# -------- Run server (Render compatible) --------
 if __name__ == "__main__":
-    import uvicorn
-    import os
-
     port = int(os.environ.get("PORT", 5000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
