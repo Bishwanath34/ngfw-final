@@ -113,11 +113,10 @@ function checkRBAC(role, path) {
 // ---------------- ML RISK SCORING ----------------
 async function scoreWithML(ctx) {
   try {
-    const res = await axios.post(
-      ML_SCORE_URL,
-      { method: ctx.method, path: ctx.path, role: ctx.role, userAgent: ctx.userAgent },
-      { timeout: 1500 }
-    );
+    const payload = { method: ctx.method, path: ctx.path, role: ctx.role, userAgent: ctx.userAgent };
+    console.log('[NGFW] ML payload:', payload);
+
+    const res = await axios.post(ML_SCORE_URL, payload, { timeout: 1500 });
     return {
       ml_risk: res.data?.ml_risk ?? 0.0,
       ml_label: res.data?.ml_label ?? 'normal',
@@ -162,8 +161,9 @@ async function inspectAndForward(req, res) {
     userId: req.headers['x-user-id'] || 'anonymous',
   };
 
+  // ---------------- URL Normalization ----------------
   const forwardPath = req.originalUrl.replace(/^\/fw/, '');
-  const target = BACKEND_URL + forwardPath;
+  const target = BACKEND_URL.replace(/\/$/, '') + forwardPath;
 
   const sigDecision = evaluateSignatures(ctx);
   const ml = await scoreWithML(ctx);
@@ -184,15 +184,17 @@ async function inspectAndForward(req, res) {
 
   try {
     console.log('[NGFW] Forwarding request to:', target);
+
     const response = await axios({
       method: req.method,
       url: target,
       data: req.body,
       headers: { ...req.headers, host: undefined }, // avoid host conflicts
-      timeout: 20000, // 20s timeout
-      httpsAgent: new https.Agent({ rejectUnauthorized: false }), // for self-signed certs
+      timeout: 20000,
+      httpsAgent: new https.Agent({ rejectUnauthorized: false }), // self-signed certs
       validateStatus: () => true,
     });
+
     res.status(response.status).send(response.data);
   } catch (err) {
     console.error('[NGFW] Backend forward error:', err.message);
