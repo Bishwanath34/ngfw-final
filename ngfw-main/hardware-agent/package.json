@@ -1,0 +1,12 @@
+{
+  "name": "hardware-agent",
+  "version": "1.0.0",
+  "description": "AI-NGFW hardware integration agent (example for hardware firewall appliance)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0"
+  }
+}
