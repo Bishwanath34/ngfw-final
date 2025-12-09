@@ -163,7 +163,7 @@ async function inspectAndForward(req, res) {
 
   // ---------------- URL Normalization ----------------
   const forwardPath = req.originalUrl.replace(/^\/fw/, '');
-  const target = BACKEND_URL.replace(/\/$/, '') + forwardPath;
+  const target = new URL(forwardPath, BACKEND_URL).toString();
 
   const sigDecision = evaluateSignatures(ctx);
   const ml = await scoreWithML(ctx);
