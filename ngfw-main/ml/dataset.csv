@@ -1,0 +1,6 @@
+timestamp,method,path,role,userId,userAgent,risk_rule,label_rule,statusCode,ml_label
+2025-01-10T12:01:00Z,GET,/info,user,alice,Chrome,0.1,normal,200,
+2025-01-10T12:02:10Z,GET,/admin/secret,guest,anonymous,Chrome,0.8,high_risk,403,
+2025-01-10T12:03:22Z,GET,/admin/secret,guest,guest123,Firefox,0.9,high_risk,403,
+2025-01-10T12:04:45Z,GET,/profile,user,bob,Chrome,0.3,medium_risk,200,
+2025-01-10T12:05:30Z,POST,/login,guest,anonymous,Chrome,0.2,normal,200,

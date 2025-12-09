@@ -1,0 +1,22 @@
+# Node / React
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dist/
+build/
+
+# Python stuff (if any ML service)
+__pycache__/
+*.pyc
+
+# Local database / logs
+db/
+*.log
+
+# Secure
+*.pem
+
+# OS junk
+.DS_Store
+Thumbs.db

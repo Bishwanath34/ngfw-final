@@ -1,0 +1,12 @@
+/* src/index.css */
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background-color: #0b1120; /* dark navy */
+  color: #e5e7eb;
+}
+
+* {
+  box-sizing: border-box;
+}
