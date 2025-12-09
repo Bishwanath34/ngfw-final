@@ -6,11 +6,12 @@ const morgan = require('morgan');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const pem = require('pem');
 const https = require('https');
 
 // ---------------- BASIC CONFIG ----------------
 const PORT = process.env.PORT || 4001;
-const BACKEND_URL = process.env.BACKEND_URL || 'https://app-dummy.onrender.com';
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:9001';
 const ML_SCORE_URL = process.env.ML_SCORE_URL || 'http://localhost:5000/score';
 const SIGNATURES_PATH = path.join(__dirname, 'signatures.json');
 const DB_DIR = path.join(__dirname, '..', 'db');
@@ -37,7 +38,7 @@ function loadSignaturesFromDisk() {
     console.log('[NGFW] Loaded', sigs.length, 'signatures from disk');
     return sigs;
   } catch (err) {
-    console.warn('[NGFW] Could not load signatures:', err.message);
+    console.log('[NGFW] Failed to load signatures:', err.message);
     return signatureCache.signatures;
   }
 }
@@ -113,17 +114,18 @@ function checkRBAC(role, path) {
 // ---------------- ML RISK SCORING ----------------
 async function scoreWithML(ctx) {
   try {
-    const payload = { method: ctx.method, path: ctx.path, role: ctx.role, userAgent: ctx.userAgent };
-    console.log('[NGFW] ML payload:', payload);
-
-    const res = await axios.post(ML_SCORE_URL, payload, { timeout: 1500 });
+    const res = await axios.post(
+      ML_SCORE_URL,
+      { method: ctx.method, path: ctx.path, role: ctx.role, userAgent: ctx.userAgent },
+      { timeout: 1500 }
+    );
     return {
       ml_risk: res.data?.ml_risk ?? 0.0,
       ml_label: res.data?.ml_label ?? 'normal',
       policy_level: res.data?.policy_level ?? null,
     };
   } catch (err) {
-    console.warn('[NGFW] ML scoring failed:', err.message);
+    console.log('[NGFW] ML scoring failed:', err.message);
     return { ml_risk: 0.0, ml_label: 'ml_error', policy_level: null };
   }
 }
@@ -161,13 +163,17 @@ async function inspectAndForward(req, res) {
     userId: req.headers['x-user-id'] || 'anonymous',
   };
 
-  // ---------------- URL Normalization ----------------
-  const forwardPath = req.originalUrl.replace(/^\/fw/, '');
-  const target = new URL(forwardPath, BACKEND_URL).toString();
+  // ---- CLEAN PATH ----
+  let forwardPath = req.originalUrl.replace(/^\/fw/, '').trim(); // remove newlines/spaces
+  forwardPath = encodeURI(forwardPath); // encode safely
+
+  const target = BACKEND_URL + forwardPath;
+  console.log('[NGFW] Forwarding request to:', target);
 
   const sigDecision = evaluateSignatures(ctx);
   const ml = await scoreWithML(ctx);
   const rbacAllowed = checkRBAC(ctx.role, forwardPath);
+
   const decision = computePolicyDecision({ rbacAllowed, sigDecision, ml });
 
   const logEntry = {
@@ -183,21 +189,16 @@ async function inspectAndForward(req, res) {
   }
 
   try {
-    console.log('[NGFW] Forwarding request to:', target);
-
     const response = await axios({
       method: req.method,
       url: target,
       data: req.body,
-      headers: { ...req.headers, host: undefined }, // avoid host conflicts
-      timeout: 20000,
-      httpsAgent: new https.Agent({ rejectUnauthorized: false }), // self-signed certs
+      headers: req.headers,
       validateStatus: () => true,
     });
-
     res.status(response.status).send(response.data);
   } catch (err) {
-    console.error('[NGFW] Backend forward error:', err.message);
+    console.log('[NGFW] Backend forward error:', err.message);
     res.status(502).json({ error: 'BACKEND_ERROR', details: err.message });
   }
 }
@@ -225,11 +226,17 @@ async function start() {
   app.use(morgan('dev'));
 
   createAdminEndpoints(app);
+
+  // ---- FIXED ROUTE ----
   app.use('/fw', inspectAndForward);
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`AI-NGFW Gateway running on http://0.0.0.0:${PORT}`);
-    console.log('Forwarding to backend:', BACKEND_URL);
+  pem.createCertificate({ days: 365, selfSigned: true }, (err, keys) => {
+    if (err) throw err;
+    const server = https.createServer({ key: keys.serviceKey, cert: keys.certificate }, app);
+    server.listen(PORT, () => {
+      console.log(`AI-NGFW Gateway running on https://localhost:${PORT}`);
+      console.log('Forwarding to backend:', BACKEND_URL);
+    });
   });
 }
 
