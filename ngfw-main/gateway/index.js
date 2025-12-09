@@ -165,7 +165,6 @@ async function inspectAndForward(req, res) {
     userId: req.headers['x-user-id'] || 'anonymous',
   };
 
-  // Remove the /fw prefix from the original URL
   const forwardPath = req.originalUrl.replace(/^\/fw/, '');
   const target = BACKEND_URL + forwardPath;
 
@@ -225,8 +224,9 @@ async function start() {
 
   createAdminEndpoints(app);
 
-  // <-- FIXED ROUTE HERE -->
-  app.all('/fw/*', inspectAndForward);
+  // ---------------- FIXED ROUTE ----------------
+  // Use a middleware that matches all paths starting with /fw
+  app.use('/fw', inspectAndForward);
 
   pem.createCertificate({ days: 365, selfSigned: true }, (err, keys) => {
     if (err) throw err;
